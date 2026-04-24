@@ -27,7 +27,7 @@
 // =============================================================================
 
 `timescale 1ns/1ps
-`include "qos_defines.v"
+`define CYCLES_PER_BIT 868 // Define here, no include
 
 module uart_rx (
     input  wire       clk_i,
@@ -38,18 +38,14 @@ module uart_rx (
     output reg        rx_valid_o
 );
 
-    // -------------------------------------------------------------------------
-    // 2-FF synchronizer
-    // -------------------------------------------------------------------------
+    // Sync rx
     reg rx_meta, rx_sync;
     always @(posedge clk_i) begin
         rx_meta <= rx_i;
         rx_sync <= rx_meta;
     end
 
-    // -------------------------------------------------------------------------
-    // FSM
-    // -------------------------------------------------------------------------
+    // FSM states
     localparam IDLE  = 2'd0;
     localparam START = 2'd1;
     localparam DATA  = 2'd2;
@@ -57,37 +53,43 @@ module uart_rx (
 
     localparam HALF_BIT = `CYCLES_PER_BIT / 2;
 
+    // FSM regs
     reg [1:0]  state;
-    reg [9:0]  baud_cnt;   // counts up to CYCLES_PER_BIT
-    reg [2:0]  bit_cnt;    // 0..7
+    reg [9:0]  baud_cnt;
+    reg [2:0]  bit_cnt;
     reg [7:0]  shift_reg;
 
     always @(posedge clk_i) begin
         if (!rst_ni) begin
-            state     <= IDLE;
-            baud_cnt  <= 10'd0;
-            bit_cnt   <= 3'd0;
-            shift_reg <= 8'd0;
-            rx_byte_o <= 8'd0;
+            // Rst defaults
+            state      <= IDLE;
+            baud_cnt   <= 10'd0;
+            bit_cnt    <= 3'd0;
+            shift_reg  <= 8'd0;
+            rx_byte_o  <= 8'd0;
             rx_valid_o <= 1'b0;
         end else begin
+            // Clear valid
             rx_valid_o <= 1'b0;
 
             case (state)
                 IDLE: begin
-                    if (!rx_sync) begin          // falling edge = start bit
+                    // Wait fall
+                    if (!rx_sync) begin
                         state    <= START;
-                        baud_cnt <= HALF_BIT;    // advance to center of start bit
+                        baud_cnt <= HALF_BIT; 
                     end
                 end
 
                 START: begin
+                    // Wait half
                     if (baud_cnt == 10'd0) begin
-                        if (!rx_sync) begin      // still low → valid start bit
+                        // Glitch chk
+                        if (!rx_sync) begin
                             state    <= DATA;
                             baud_cnt <= `CYCLES_PER_BIT;
                             bit_cnt  <= 3'd0;
-                        end else begin           // glitch — abort
+                        end else begin
                             state <= IDLE;
                         end
                     end else begin
@@ -96,9 +98,11 @@ module uart_rx (
                 end
 
                 DATA: begin
+                    // Shift LSB
                     if (baud_cnt == 10'd0) begin
-                        shift_reg <= {rx_sync, shift_reg[7:1]};  // LSB first
+                        shift_reg <= {rx_sync, shift_reg[7:1]};
                         baud_cnt  <= `CYCLES_PER_BIT;
+                        // Chk last
                         if (bit_cnt == 3'd7) begin
                             state   <= STOP;
                             bit_cnt <= 3'd0;
@@ -111,6 +115,7 @@ module uart_rx (
                 end
 
                 STOP: begin
+                    // Out byte
                     if (baud_cnt == 10'd0) begin
                         rx_byte_o  <= shift_reg;
                         rx_valid_o <= 1'b1;
