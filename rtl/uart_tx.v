@@ -19,8 +19,10 @@
 //   [ ] Back-to-back bytes without gaps.
 // =============================================================================
 
+
+
 `timescale 1ns/1ps
-`include "qos_defines.v"
+`define CYCLES_PER_BIT 868 // Define here, no include
 
 module uart_tx (
     input  wire       clk_i,
@@ -38,18 +40,18 @@ module uart_tx (
     localparam STOP  = 2'd3;
 
     reg [1:0]  state;
-    reg [9:0]  baud_cnt;
+    reg [15:0] baud_cnt; // Increased width for flexibility
     reg [2:0]  bit_cnt;
     reg [7:0]  shift_reg;
 
     always @(posedge clk_i) begin
         if (!rst_ni) begin
-            state     <= IDLE;
-            tx_o      <= 1'b1;
+            state      <= IDLE;
+            tx_o       <= 1'b1;
             tx_ready_o <= 1'b1;
-            baud_cnt  <= 10'd0;
-            bit_cnt   <= 3'd0;
-            shift_reg <= 8'd0;
+            baud_cnt   <= 16'd0;
+            bit_cnt    <= 3'd0;
+            shift_reg  <= 8'd0;
         end else begin
             case (state)
                 IDLE: begin
@@ -58,46 +60,47 @@ module uart_tx (
                     if (tx_valid_i) begin
                         shift_reg  <= tx_byte_i;
                         tx_ready_o <= 1'b0;
-                        tx_o       <= 1'b0;    // start bit
+                        tx_o       <= 1'b0; // Start bit
                         baud_cnt   <= `CYCLES_PER_BIT - 1;
                         state      <= START;
                     end
                 end
 
                 START: begin
-                    if (baud_cnt == 10'd0) begin
-                        tx_o     <= shift_reg[0];
-                        shift_reg <= {1'b0, shift_reg[7:1]};
-                        baud_cnt <= `CYCLES_PER_BIT - 1;
-                        bit_cnt  <= 3'd0;
-                        state    <= DATA;
+                    if (baud_cnt == 16'd0) begin
+                        tx_o      <= shift_reg[0];
+                        shift_reg <= {1'b0, shift_reg[7:1]}; // Shift right
+                        baud_cnt  <= `CYCLES_PER_BIT - 1;
+                        bit_cnt   <= 3'd0;
+                        state     <= DATA;
                     end else begin
-                        baud_cnt <= baud_cnt - 10'd1;
+                        baud_cnt <= baud_cnt - 16'd1;
                     end
                 end
 
                 DATA: begin
-                    if (baud_cnt == 10'd0) begin
+                    if (baud_cnt == 16'd0) begin
                         if (bit_cnt == 3'd7) begin
-                            tx_o     <= 1'b1;      // stop bit
+                            tx_o     <= 1'b1; // Stop bit
                             baud_cnt <= `CYCLES_PER_BIT - 1;
                             state    <= STOP;
                         end else begin
-                            bit_cnt  <= bit_cnt + 3'd1;
-                            tx_o     <= shift_reg[0];
+                            bit_cnt   <= bit_cnt + 3'd1;
+                            tx_o      <= shift_reg[0];
                             shift_reg <= {1'b0, shift_reg[7:1]};
-                            baud_cnt <= `CYCLES_PER_BIT - 1;
+                            baud_cnt  <= `CYCLES_PER_BIT - 1;
                         end
                     end else begin
-                        baud_cnt <= baud_cnt - 10'd1;
+                        baud_cnt <= baud_cnt - 16'd1;
                     end
                 end
 
                 STOP: begin
-                    if (baud_cnt == 10'd0) begin
-                        state <= IDLE;
+                    if (baud_cnt == 16'd0) begin
+                        tx_ready_o <= 1'b1;
+                        state      <= IDLE;
                     end else begin
-                        baud_cnt <= baud_cnt - 10'd1;
+                        baud_cnt <= baud_cnt - 16'd1;
                     end
                 end
 
