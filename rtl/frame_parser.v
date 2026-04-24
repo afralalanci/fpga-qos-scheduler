@@ -37,193 +37,123 @@
 //   [ ] rd_metrics_req_o pulses on TYPE_RD_MET.
 //   [ ] set_param_* correct on TYPE_SET_PAR.
 // =============================================================================
-
 `timescale 1ns/1ps
-`include "qos_defines.v"
 
-module frame_parser (
-    input  wire        clk_i,
-    input  wire        rst_ni,
+// Macros replacing qos_defines.v
+`define CYCLES_PER_BIT 868
+`define FRAME_SOF      8'hA5
+`define TYPE_SAFETY    8'h01
+`define TYPE_AI_HB     8'h02
+`define TYPE_AI_TASK   8'h03
+`define TYPE_RD_MET    8'h10
+`define TYPE_SET_PAR   8'h11
+`define TASK_W         104
+`define TASK_TYPE_HI   103
+`define TASK_TYPE_LO   96
+`define TASK_ENQ_HI    95
+`define TASK_ENQ_LO    64
+`define TASK_P0_HI     63
+`define TASK_P0_LO     32
+`define TASK_P1_HI     31
+`define TASK_P1_LO     0
 
-    // From uart_rx
-    input  wire [7:0]  rx_byte_i,
-    input  wire        rx_valid_i,
+module uart_rx (
+    input  wire       clk_i,
+    input  wire       rst_ni,
+    input  wire       rx_i,
 
-    // To task_fifo
-    input  wire        enq_ready_i,
-    output reg         enq_valid_o,
-    output reg  [`TASK_W-1:0] enq_task_o,
-
-    // Timestamp
-    input  wire [31:0] ms_count_i,
-
-    // To watchdog
-    output reg         ai_heartbeat_o,
-
-    // To metrics
-    output reg         rd_metrics_req_o,
-    output reg         set_param_valid_o,
-    output reg  [7:0]  set_param_id_o,
-    output reg  [31:0] set_param_val_o,
-
-    // Debug
-    output reg         frame_err_o
+    output reg  [7:0] rx_byte_o,
+    output reg        rx_valid_o
 );
 
-    localparam MAX_PAYLOAD = 8;
+    // Sync RX
+    reg rx_meta, rx_sync;
+    always @(posedge clk_i) begin
+        rx_meta <= rx_i;
+        rx_sync <= rx_meta;
+    end
 
-    // FSM states
-    localparam WAIT_SOF     = 3'd0;
-    localparam RECV_TYPE    = 3'd1;
-    localparam RECV_LEN     = 3'd2;
-    localparam RECV_PAYLOAD = 3'd3;
-    localparam RECV_CRC     = 3'd4;
-    localparam EMIT         = 3'd5;
+    // States
+    localparam IDLE  = 2'd0;
+    localparam START = 2'd1;
+    localparam DATA  = 2'd2;
+    localparam STOP  = 2'd3;
 
-    reg [2:0]  state;
-    reg [7:0]  r_type;
-    reg [7:0]  r_len;
-    reg [7:0]  payload_buf [0:MAX_PAYLOAD-1];
-    reg [3:0]  byte_cnt;
-    reg [31:0] r_enq_time;
+    localparam HALF_BIT = `CYCLES_PER_BIT / 2;
 
-    // Pack helpers
-    wire [15:0] w_dist  = {payload_buf[0], payload_buf[1]};
-    wire [15:0] w_speed = {payload_buf[2], payload_buf[3]};
-    wire [15:0] w_work  = {payload_buf[0], payload_buf[1]};
-    wire [7:0]  w_pid   = payload_buf[0];
-    wire [31:0] w_val   = {payload_buf[1], payload_buf[2],
-                           payload_buf[3], payload_buf[4]};
-
-    integer i;
+    // FSM regs
+    reg [1:0]  state;
+    reg [9:0]  baud_cnt;
+    reg [2:0]  bit_cnt;
+    reg [7:0]  shift_reg;
 
     always @(posedge clk_i) begin
         if (!rst_ni) begin
-            state           <= WAIT_SOF;
-            enq_valid_o     <= 1'b0;
-            enq_task_o      <= {`TASK_W{1'b0}};
-            ai_heartbeat_o  <= 1'b0;
-            rd_metrics_req_o <= 1'b0;
-            set_param_valid_o <= 1'b0;
-            set_param_id_o  <= 8'd0;
-            set_param_val_o <= 32'd0;
-            frame_err_o     <= 1'b0;
-            r_type          <= 8'd0;
-            r_len           <= 8'd0;
-            byte_cnt        <= 4'd0;
-            r_enq_time      <= 32'd0;
-            for (i = 0; i < MAX_PAYLOAD; i = i + 1)
-                payload_buf[i] <= 8'd0;
+            // Reset
+            state      <= IDLE;
+            baud_cnt   <= 10'd0;
+            bit_cnt    <= 3'd0;
+            shift_reg  <= 8'd0;
+            rx_byte_o  <= 8'd0;
+            rx_valid_o <= 1'b0;
         end else begin
-            // Deassert strobes by default
-            ai_heartbeat_o   <= 1'b0;
-            rd_metrics_req_o <= 1'b0;
-            set_param_valid_o <= 1'b0;
-            frame_err_o      <= 1'b0;
+            // Def low
+            rx_valid_o <= 1'b0;
 
             case (state)
-                // ----------------------------------------------------------
-                WAIT_SOF: begin
-                    enq_valid_o <= 1'b0;
-                    if (rx_valid_i && rx_byte_i == `FRAME_SOF)
-                        state <= RECV_TYPE;
+                IDLE: begin
+                    // Wait fall
+                    if (!rx_sync) begin
+                        state    <= START;
+                        baud_cnt <= HALF_BIT; 
+                    end
                 end
 
-                // ----------------------------------------------------------
-                RECV_TYPE: begin
-                    if (rx_valid_i) begin
-                        // Validate known types
-                        if (rx_byte_i == `TYPE_SAFETY  ||
-                            rx_byte_i == `TYPE_AI_HB   ||
-                            rx_byte_i == `TYPE_AI_TASK  ||
-                            rx_byte_i == `TYPE_RD_MET  ||
-                            rx_byte_i == `TYPE_SET_PAR) begin
-                            r_type      <= rx_byte_i;
-                            r_enq_time  <= ms_count_i;
-                            state       <= RECV_LEN;
+                START: begin
+                    // Wait half
+                    if (baud_cnt == 10'd0) begin
+                        // Glitch chk
+                        if (!rx_sync) begin
+                            state    <= DATA;
+                            baud_cnt <= `CYCLES_PER_BIT;
+                            bit_cnt  <= 3'd0;
                         end else begin
-                            frame_err_o <= 1'b1;
-                            state       <= WAIT_SOF;
+                            state <= IDLE;
                         end
+                    end else begin
+                        baud_cnt <= baud_cnt - 10'd1;
                     end
                 end
 
-                // ----------------------------------------------------------
-                RECV_LEN: begin
-                    if (rx_valid_i) begin
-                        if (rx_byte_i > MAX_PAYLOAD) begin
-                            frame_err_o <= 1'b1;
-                            state       <= WAIT_SOF;
+                DATA: begin
+                    // Shift LSB
+                    if (baud_cnt == 10'd0) begin
+                        shift_reg <= {rx_sync, shift_reg[7:1]};
+                        baud_cnt  <= `CYCLES_PER_BIT;
+                        // Chk last
+                        if (bit_cnt == 3'd7) begin
+                            state   <= STOP;
+                            bit_cnt <= 3'd0;
                         end else begin
-                            r_len    <= rx_byte_i;
-                            byte_cnt <= 4'd0;
-                            state    <= (rx_byte_i == 8'd0) ? RECV_CRC
-                                                             : RECV_PAYLOAD;
+                            bit_cnt <= bit_cnt + 3'd1;
                         end
+                    end else begin
+                        baud_cnt <= baud_cnt - 10'd1;
                     end
                 end
 
-                // ----------------------------------------------------------
-                RECV_PAYLOAD: begin
-                    if (rx_valid_i) begin
-                        payload_buf[byte_cnt] <= rx_byte_i;
-                        if (byte_cnt == (r_len - 4'd1))
-                            state <= RECV_CRC;
-                        else
-                            byte_cnt <= byte_cnt + 4'd1;
+                STOP: begin
+                    // Out byte
+                    if (baud_cnt == 10'd0) begin
+                        rx_byte_o  <= shift_reg;
+                        rx_valid_o <= 1'b1;
+                        state      <= IDLE;
+                    end else begin
+                        baud_cnt <= baud_cnt - 10'd1;
                     end
                 end
 
-                // ----------------------------------------------------------
-                RECV_CRC: begin
-                    // CRC stub: consume the byte, always pass
-                    if (rx_valid_i) begin
-                        state <= EMIT;
-                        // Dispatch non-FIFO commands immediately
-                        case (r_type)
-                            `TYPE_AI_HB: begin
-                                ai_heartbeat_o <= 1'b1;
-                                state          <= WAIT_SOF;
-                            end
-                            `TYPE_RD_MET: begin
-                                rd_metrics_req_o <= 1'b1;
-                                state            <= WAIT_SOF;
-                            end
-                            `TYPE_SET_PAR: begin
-                                set_param_valid_o <= 1'b1;
-                                set_param_id_o    <= w_pid;
-                                set_param_val_o   <= w_val;
-                                state             <= WAIT_SOF;
-                            end
-                            default: begin
-                                // SAFETY and AI_TASK go to FIFO via EMIT
-                                // Build task descriptor flat vector
-                                enq_task_o[`TASK_TYPE_HI:`TASK_TYPE_LO] <= r_type;
-                                enq_task_o[`TASK_ENQ_HI:`TASK_ENQ_LO]   <= r_enq_time;
-                                enq_task_o[`TASK_P1_HI:`TASK_P1_LO]     <= 32'd0;
-                                if (r_type == `TYPE_SAFETY)
-                                    enq_task_o[`TASK_P0_HI:`TASK_P0_LO] <=
-                                        {w_dist, w_speed};
-                                else  // AI_TASK
-                                    enq_task_o[`TASK_P0_HI:`TASK_P0_LO] <=
-                                        {16'd0, w_work};
-                                enq_valid_o <= 1'b1;
-                                state       <= EMIT;
-                            end
-                        endcase
-                    end
-                end
-
-                // ----------------------------------------------------------
-                EMIT: begin
-                    // Hold enq_valid until FIFO accepts
-                    if (enq_ready_i) begin
-                        enq_valid_o <= 1'b0;
-                        state       <= WAIT_SOF;
-                    end
-                end
-
-                default: state <= WAIT_SOF;
+                default: state <= IDLE;
             endcase
         end
     end
